@@ -1,0 +1,2 @@
+# zigma-trader
+Personal assistance 
