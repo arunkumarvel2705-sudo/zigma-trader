@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from zigma import data, fundamentals, intraday, journal, swing
+from zigma import data, fundamentals, intraday, journal, stats, swing
 from zigma.charges import round_trip_cost
 from zigma.levels import Camarilla
 
@@ -86,9 +86,20 @@ def intraday_rules_form(key: str) -> intraday.IntradayRules:
         trend = c3.toggle("Trade only with 1h trend", True, key=f"tr_{key}")
         short = c4.toggle("Allow sell (short) side", True, key=f"sh_{key}")
         cap = st.number_input("Money per trade (₹)", 1000, 1_000_000, 10_000, 1000, key=f"c_{key}")
+        st.markdown("**Extra filters from the books** (off = 0)")
+        c5, c6 = st.columns(2)
+        min_adx = c5.number_input("Min ADX (Wilder)", 0.0, 60.0, 0.0, 5.0, key=f"adx_{key}",
+                                  help="ADX below 20 = no real trend. 0 = off.")
+        min_vol = c6.number_input("Min volume × avg (Murphy)", 0.0, 5.0, 0.0, 0.5, key=f"vol_{key}",
+                                  help="Breakout candle volume vs the previous 20 candles. 0 = off.")
+        c7, c8 = st.columns(2)
+        nr7_only = c7.toggle("Only after NR7 day (Crabel)", False, key=f"nr7_{key}")
+        max_cpr = c8.number_input("Max CPR width % (Ochoa)", 0.0, 2.0, 0.0, 0.25, key=f"cpr_{key}",
+                                  help="Narrow CPR hints at a trending day. 0 = off.")
     return intraday.IntradayRules(target_pct=target, stop_pct=stop, trend_filter=trend, allow_short=short,
                                   stop_mode="close_back_inside" if mode.startswith("Close") else "fixed",
-                                  capital_per_trade=float(cap))
+                                  capital_per_trade=float(cap), min_adx=min_adx, min_volume_ratio=min_vol,
+                                  nr7_only=nr7_only, max_cpr_width=max_cpr)
 
 
 def level_chart(sym, bars, lv: Camarilla, title=""):
@@ -221,12 +232,16 @@ def page_backtest():
         m15 = get_prices(tuple(syms), "60d", "15m")
         h1 = get_prices(tuple(syms), "180d", "1h")
         d1 = get_prices(tuple(syms), "6mo", "1d")
+        base = []
         for i, s in enumerate(syms):
             prog.progress((i + 1) / len(syms), text=f"Testing {s}")
             if s in m15 and s in d1:
                 t = intraday.backtest(s, m15[s], d1[s], h1.get(s), rules)
                 if not t.empty:
                     trades.append(t)
+                b = intraday.baseline(s, m15[s], d1[s], rules)
+                if not b.empty:
+                    base.append(b)
     else:
         d1 = get_prices(tuple(syms), "2y", "1d")
         for i, s in enumerate(syms):
@@ -255,6 +270,20 @@ def page_backtest():
     c5.metric("Avg win", inr(s["avg_win"]))
     c6.metric("Avg loss", inr(s["avg_loss"]))
 
+    lo, hi = stats.wilson(int((tr.net > 0).sum()), len(tr))
+    rs = stats.r_stats(tr)
+    ts_ = stats.t_stat(tr.net)
+    st.markdown("#### How sure can we be?")
+    sure = [f"True win rate is likely between **{lo:.0%} and {hi:.0%}** (95% range on {len(tr)} trades). "
+            "The fewer the trades, the wider this range."]
+    if rs:
+        sure.append(f"Expectancy **{rs['expectancy_R']:+.2f}R** per trade — wins average {rs['avg_win_R']:+.2f}R, "
+                    f"losses {rs['avg_loss_R']:+.2f}R (R = what you lose if the stop is hit; Van Tharp).")
+    if ts_ is not None:
+        sure.append(f"Average result is **{ts_:.1f}** standard errors from zero — "
+                    + ("unlikely to be luck." if abs(ts_) >= 2 else "could easily be luck (needs ≥ 2)."))
+    st.markdown("\n".join(f"- {x}" for x in sure))
+
     st.markdown("#### Verdict")
     claim = 0.80
     lines = []
@@ -276,6 +305,37 @@ def page_backtest():
         lines.append(f"It lost money even before charges; charges added another **{inr(s['charges'])}**.")
     lines.append(f"Worst losing streak cost **{inr(s['max_drawdown'])}**.")
     st.markdown("\n".join(f"- {x}" for x in lines))
+
+    if mode.startswith("Intraday") and base:
+        b = pd.concat(base, ignore_index=True)
+        st.markdown("#### Does the R3 rule beat a simple benchmark?")
+        bw = (b.net > 0).mean()
+        st.markdown(f"Benchmark: **buy every stock at 9:45 every day**, same target and stop (David Aronson's idea — "
+                    f"a rule only has value if it beats doing something simple). Benchmark: {len(b)} trades, "
+                    f"win rate **{bw:.0%}**, average **{inr(b.net.mean())}** per trade. "
+                    f"Your rules: win rate **{s['win_rate']:.0%}**, average **{inr(s['expectancy'])}**.")
+        if s["expectancy"] > b.net.mean():
+            st.success("The rules did better than the benchmark per trade.")
+        else:
+            st.error("The rules did no better than buying at 9:45 — the levels aren't adding value here.")
+
+        imp = stats.filter_impact(tr)
+        if not imp.empty:
+            st.markdown("#### Which filter helps?")
+            st.caption("Every trade records these readings. Compare trades that passed each filter with those that "
+                       "didn't — keep a filter only if the 'pass' row is clearly better on a decent number of trades.")
+            st.dataframe(imp, hide_index=True, width="stretch", column_config={
+                "win_rate": st.column_config.ProgressColumn("win rate", format="percent", min_value=0, max_value=1),
+                "avg_R": st.column_config.NumberColumn("avg R", format="%.2f"),
+                "net": st.column_config.NumberColumn(format="₹%d")})
+
+    halves = stats.split_halves(tr, date_col)
+    if len(tr) >= 20:
+        st.markdown("#### First half vs second half")
+        st.caption("Robert Pardo's check: a real edge shows up in both halves, not just one lucky stretch.")
+        st.dataframe(halves, hide_index=True, width="stretch", column_config={
+            "win_rate": st.column_config.ProgressColumn("win rate", format="percent", min_value=0, max_value=1),
+            "net": st.column_config.NumberColumn(format="₹%d")})
 
     st.markdown("#### Running profit")
     curve = tr.net.cumsum()
@@ -300,7 +360,8 @@ def page_backtest():
                      hide_index=True, width="stretch",
                      column_config={"net": st.column_config.NumberColumn(format="₹%d")})
     with st.expander(f"All {len(tr)} trades"):
-        cols = [c for c in ["symbol", date_col, "side", "entry", "exit", "reason", "qty", "net", "net_pct", "trend"] if c in tr]
+        cols = [c for c in ["symbol", date_col, "side", "entry", "exit", "reason", "qty", "net", "R", "trend", "adx",
+                            "vol_ratio", "nr7", "cpr_width"] if c in tr]
         st.dataframe(tr[cols], hide_index=True, width="stretch")
     st.download_button("Download trades (CSV)", tr.to_csv(index=False), "backtest_trades.csv", "text/csv")
 
@@ -395,14 +456,19 @@ def page_journal():
         qty = c8.number_input("Qty", 0, value=int(pre.get("qty", 0)))
         exit_px = c9.number_input("Exit (0 if still open)", 0.0, format="%.2f")
         ok = st.checkbox("I followed every rule (time, trend, levels, stop)", True)
-        notes = st.text_input("Notes", placeholder="Why I took it / what I felt")
+        c10, c11 = st.columns(2)
+        feel = c10.selectbox("How I felt", ["Calm", "Confident", "Anxious", "FOMO", "Revenge", "Bored"])
+        mistake = c11.selectbox("Mistake", ["None", "Entered early", "Entered late", "Moved stop",
+                                            "Exited early", "Ignored trend", "Too big size", "Not in plan"])
+        notes = st.text_input("Notes", placeholder="Why I took it / what I learned")
         if st.form_submit_button("Save", type="primary"):
             if not sym or entry <= 0 or qty <= 0:
                 st.error("Enter a symbol, entry price and quantity.")
             else:
                 row = {"date": str(d), "symbol": sym, "strategy": strat, "side": side, "entry": entry,
                        "stop": stop, "target": target, "exit": exit_px or None, "qty": qty,
-                       "status": "Closed" if exit_px else "Open", "followed_rules": ok, "notes": notes}
+                       "status": "Closed" if exit_px else "Open", "followed_rules": ok,
+                       "notes": f"[{feel} | {mistake}] {notes}".strip()}
                 row["net"] = journal.compute_net(row, round_trip_cost) if exit_px else None
                 st.session_state.journal = pd.concat([st.session_state.journal, pd.DataFrame([row])],
                                                      ignore_index=True)
@@ -475,6 +541,15 @@ the minimum needed to test it — those are marked *(added)*.
 - Debt < 25% of market cap · P/E below industry · sales, profit, reserves, assets rising · borrowings falling.
 - Promoters > 50%, FII > 10%, DII > 10%.
 
+#### Optional filters from the books (off by default)
+- **ADX ≥ 20–25** on the 1-hour chart — Wilder's test for a real trend.
+- **Breakout volume ≥ 1.5×** the previous 20 candles — Murphy: volume confirms a breakout.
+- **Previous day NR7** — Crabel: the quietest day in 7 often comes before a big move.
+- **Narrow CPR** — Ochoa: a narrow central pivot range hints at a trending day.
+
+Every trade records these readings, so the Backtest and Forward test pages can show whether each one helps
+*before* you switch it on.
+
 #### What the app can't do
 - It doesn't place orders and never will — you decide every trade.
 - Free data has ~60 days of 15-minute candles, so intraday backtests are short.
@@ -485,11 +560,145 @@ the minimum needed to test it — those are marked *(added)*.
                "This app is a learning tool, not investment advice.")
 
 
+REPO_RAW = "https://raw.githubusercontent.com/arunkumarvel2705-sudo/zigma-trader/main/data/"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def read_forward(name: str) -> pd.DataFrame:
+    from pathlib import Path
+    base = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+    local = base / "data" / name
+    try:
+        return pd.read_csv(REPO_RAW + name)          # freshest copy (bot pushes daily)
+    except Exception:
+        return pd.read_csv(local) if local.exists() else pd.DataFrame()
+
+
+def page_forward():
+    st.title("Forward test")
+    st.caption("Every trading day at 4:15 PM a robot runs the frozen class rules on the Nifty 100 and records every "
+               "setup and its result — no hindsight, no tweaking. This is the honest accuracy test.")
+    log, days = read_forward("forward_intraday.csv"), read_forward("forward_days.csv")
+    if log.empty:
+        st.info("No results yet. The first results appear after the next trading day's 4:15 PM run. "
+                "To run it now: GitHub → zigma-trader → **Actions** → **Daily forward test** → **Run workflow**.")
+        return
+    n_days = days.date.nunique() if not days.empty else log.date.nunique()
+    st.progress(min(n_days / 60, 1.0), text=f"{n_days} trading days recorded — target 60 (≈ 3 months)")
+    variant = st.segmented_control("Rules", ["class", "raw"], default="class",
+                                   format_func=lambda v: "Class rules (with 1h trend)" if v == "class" else "All breakouts (no filter)") or "class"
+    v = log[log.variant == variant].copy()
+    if v.empty:
+        st.warning("No trades for this version yet.")
+        return
+    v["net"] = pd.to_numeric(v.net, errors="coerce")
+    wins = int((v.net > 0).sum())
+    lo, hi = stats.wilson(wins, len(v))
+    c1, c2 = st.columns(2)
+    c1.metric("Trades", len(v), f"{len(v) / max(n_days, 1):.1f} per day", delta_color="off")
+    c2.metric("Win rate", f"{wins / len(v):.0%}", f"likely {lo:.0%}–{hi:.0%}", delta_color="off")
+    c3, c4 = st.columns(2)
+    c3.metric("Net after charges", inr(v.net.sum()), f"₹{int(intraday.IntradayRules().capital_per_trade):,} per trade",
+              delta_color="off")
+    rs = stats.r_stats(v)
+    c4.metric("Expectancy", f"{rs['expectancy_R']:+.2f}R" if rs else "—", help="Average result per trade in units of risk")
+    st.markdown(f"Class notes claim **80%** accuracy. Forward result so far: **{wins / len(v):.0%}** "
+                f"(likely range {lo:.0%}–{hi:.0%}).")
+
+    v = v.sort_values(["date", "entry_time"])
+    fig = go.Figure(go.Scatter(x=pd.to_datetime(v.date), y=v.net.cumsum(), mode="lines", line=dict(color=PINK, width=2)))
+    fig.add_hline(y=0, line_color=GREY)
+    fig.update_layout(height=240, margin=dict(l=0, r=0, t=10, b=0), yaxis_tickprefix="₹")
+    st.plotly_chart(fig, width="stretch", config=CFG)
+
+    imp = stats.filter_impact(log[log.variant == "raw"].assign(net=lambda d: pd.to_numeric(d.net, errors="coerce")))
+    if not imp.empty:
+        st.markdown("#### Which filter helps? (all breakouts)")
+        st.dataframe(imp, hide_index=True, width="stretch", column_config={
+            "win_rate": st.column_config.ProgressColumn("win rate", format="percent", min_value=0, max_value=1),
+            "avg_R": st.column_config.NumberColumn("avg R", format="%.2f"),
+            "net": st.column_config.NumberColumn(format="₹%d")})
+    by = v.groupby("symbol").agg(trades=("net", "size"), win_rate=("net", lambda x: (x > 0).mean()),
+                                 net=("net", "sum")).sort_values("net", ascending=False).reset_index()
+    with st.expander("By stock"):
+        st.dataframe(by, hide_index=True, width="stretch", column_config={
+            "win_rate": st.column_config.ProgressColumn("win rate", format="percent", min_value=0, max_value=1),
+            "net": st.column_config.NumberColumn(format="₹%d")})
+    with st.expander("By exit reason"):
+        st.dataframe(v.groupby("reason").agg(trades=("net", "size"), net=("net", "sum")).reset_index(),
+                     hide_index=True, width="stretch")
+    with st.expander(f"All {len(v)} trades"):
+        st.dataframe(v.sort_values(["date", "entry_time"], ascending=False), hide_index=True, width="stretch")
+    sw = read_forward("forward_swing.csv")
+    if not sw.empty:
+        st.markdown("#### Swing trades since the start")
+        sw["net"] = pd.to_numeric(sw.net, errors="coerce")
+        a, b = st.columns(2)
+        a.metric("Closed swing trades", len(sw))
+        b.metric("Win rate", f"{(sw.net > 0).mean():.0%}")
+        st.dataframe(sw[["symbol", "entry_date", "entry", "exit_date", "exit", "reason", "net_pct"]], hide_index=True,
+                     width="stretch")
+
+
+BOOKS = [
+    ("Secrets of a Pivot Boss", "Franklin O. Ochoa (2010)",
+     "Camarilla equation, two-day pivot relationships, Central Pivot Range (CPR) and pivot width forecasting.",
+     "CPR width is recorded on every trade and can be used as a filter."),
+    ("Day Trading with Short Term Price Patterns and Opening Range Breakout", "Toby Crabel (1990)",
+     "Opening-range breakouts and narrow-range days (NR4/NR7) — quiet days before big moves.",
+     "Previous-day NR7 is recorded and can be used as a filter. Your 9:45 rule is an opening-range idea."),
+    ("New Concepts in Technical Trading Systems", "J. Welles Wilder Jr. (1978)",
+     "ADX for trend strength (below 20 = no trend) and ATR for volatility.",
+     "ADX(14) on the 1-hour chart is recorded and can be used to skip sideways markets."),
+    ("Technical Analysis of the Financial Markets", "John J. Murphy (1999)",
+     "Trends, support/resistance, patterns, and volume as confirmation of breakouts.",
+     "Breakout-candle volume vs average is recorded and can be used as a filter."),
+    ("Japanese Candlestick Charting Techniques", "Steve Nison",
+     "Hammer, shooting star, engulfing patterns and how to use them for confirmation.",
+     "The four patterns from your notes are detected; swing entries can require one."),
+    ("Encyclopedia of Chart Patterns", "Thomas N. Bulkowski (3rd ed., 2021)",
+     "Measured success and failure rates for double tops/bottoms, head & shoulders, triangles.",
+     "Next step: automate the 27–28/12 patterns and compare with his published numbers."),
+    ("Trade Your Way to Financial Freedom", "Van K. Tharp",
+     "R-multiples, expectancy and position sizing — judge a system by average R, not win rate.",
+     "Every trade shows its R-multiple; Backtest and Forward test show expectancy in R."),
+    ("Evidence-Based Technical Analysis", "David Aronson (2006)",
+     "Testing trading rules scientifically: benchmarks, confidence intervals, data-mining bias.",
+     "Win-rate confidence range, t-statistic and the 'buy at 9:45' benchmark."),
+    ("The Evaluation and Optimization of Trading Strategies", "Robert Pardo (2nd ed., 2008)",
+     "Out-of-sample and walk-forward testing to avoid fitting rules to the past.",
+     "First-half vs second-half check, and the daily forward test with frozen rules."),
+    ("Trading in the Zone", "Mark Douglas (2000)",
+     "Thinking in probabilities, following rules consistently, handling losses.",
+     "Journal tracks whether you followed the rules and how you felt."),
+    ("The Daily Trading Coach", "Brett N. Steenbarger (2009)",
+     "Using a journal to review mistakes and build better habits.",
+     "Journal 'mistake' field and weekly review of rule-breaking trades."),
+    ("The Intelligent Investor", "Benjamin Graham",
+     "Margin of safety, buying good businesses below their value — the basis of the 23/11 checklist.",
+     "Fundamentals page: P/E vs industry, debt, growth checks."),
+    ("Value Investing: The Use of Historical Financial Statement Information", "Joseph Piotroski (2000, paper)",
+     "The F-Score: 9 simple accounting checks on profitability, leverage and efficiency.",
+     "Next step: add the F-Score to the Fundamentals page."),
+]
+
+
+def page_reading():
+    st.title("Further reading")
+    st.caption("The books behind each part of the app — what to read, and where it shows up here.")
+    for title, author, idea, in_app in BOOKS:
+        with st.container(border=True):
+            st.markdown(f"**{title}**  \n{author}")
+            st.markdown(f"{idea}  \n*In the app:* {in_app}")
+
+
 PAGES = {
     "today": st.Page(page_today, title="Today", icon="📡", default=True),
     "backtest": st.Page(page_backtest, title="Backtest", icon="🧪"),
     "fund": st.Page(page_fundamentals, title="Fundamentals", icon="🏢"),
+    "forward": st.Page(page_forward, title="Forward test", icon="⏱️"),
     "journal": st.Page(page_journal, title="Paper trades", icon="📝"),
     "rules": st.Page(page_rules, title="Rules", icon="📘"),
+    "reading": st.Page(page_reading, title="Reading", icon="📚"),
 }
 st.navigation(list(PAGES.values()), position="top").run()

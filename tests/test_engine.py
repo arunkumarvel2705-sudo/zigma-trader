@@ -189,3 +189,33 @@ def test_fundamental_checklist():
     assert r["slab"] == "Large cap" and r["score"] == r["checked"] == 9
     m["total_debt"] = 9_000 * 1e7
     assert fundamentals.evaluate(m, 25)["Debt < 25% of mcap"] is False
+
+
+# ------------------------------------------------------------------ stats & indicators
+def test_wilson_interval():
+    from zigma.stats import wilson
+    lo, hi = wilson(16, 20)              # 80% on 20 trades
+    assert lo < 0.6 and hi > 0.9         # far too wide to trust
+    lo, hi = wilson(160, 200)
+    assert 0.73 < lo < 0.8 < hi < 0.86
+
+
+def test_adx_and_nr7():
+    from zigma.indicators import adx, nr7, cpr_width_pct
+    n = 80
+    trend = pd.DataFrame({"High": np.arange(n) + 1.0, "Low": np.arange(n) - 1.0, "Close": np.arange(n) * 1.0})
+    assert adx(trend).iloc[-1] > 40      # steady climb = strong trend
+    d = pd.DataFrame({"High": [10, 10, 10, 10, 10, 10, 9.2], "Low": [8, 8, 8, 8, 8, 8, 8.9]})
+    assert bool(nr7(d).iloc[-1])
+    assert cpr_width_pct(110, 90, 100) == pytest.approx(0.0)
+
+
+def test_trade_records_features_and_R():
+    path = _flat(108, 1) + [(109, 111.2, 108.8, 111.0), (111, 112.3, 110.9, 112.0)] + _flat(112, 22)
+    ctx = intraday.DayContext(nr7=True, cpr_width=0.3, adx_of=lambda t: 27.0, vol_of=lambda t: 2.0)
+    t, _ = intraday.run_day(_day_bars(date(2026, 1, 5), path), PREV, RULES, ctx=ctx)
+    assert t["adx"] == 27.0 and t["vol_ratio"] == 2.0 and t["nr7"] is True
+    assert t["R"] == pytest.approx(t["net"] / (111 * 0.01 * t["qty"]))
+    strict = intraday.IntradayRules(trend_filter=False, min_adx=30)
+    t2, st = intraday.run_day(_day_bars(date(2026, 1, 5), path), PREV, strict, ctx=ctx)
+    assert t2 is None and "ADX" in st["note"]

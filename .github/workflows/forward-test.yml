@@ -1,0 +1,32 @@
+name: Daily forward test
+
+on:
+  schedule:
+    - cron: "45 10 * * 1-5"   # 16:15 IST, Monday–Friday, after the 15:30 close
+  workflow_dispatch:           # "Run workflow" button for a manual run
+
+permissions:
+  contents: write
+
+jobs:
+  forward-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python scripts/forward_test.py
+      - name: Save results
+        run: |
+          git config user.name "forward-test-bot"
+          git config user.email "forward-test-bot@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No new results"
+          else
+            git commit -m "Forward test results $(date -u +%Y-%m-%d)"
+            git push
+          fi
