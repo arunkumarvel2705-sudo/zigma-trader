@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.streamlit/secrets.toml
+*.xls
+*.xlsx
+paper_trades_*.csv
